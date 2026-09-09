@@ -1,0 +1,95 @@
+;; uniq -- POSIX uniq (IEEE Std 1003.1) for ONE operand.
+;;
+;;   uniq FILE       adjacent duplicate lines collapsed to one
+;;   uniq -c FILE    each run prefixed with its count
+;;
+;; ADJACENT is the whole contract: `a a b a` answers `a b a`, not `a b`.
+;; That is what makes `sort | uniq` a pipeline and not a redundancy.
+;;
+;; ## The -c format, measured at its boundary
+;;
+;; `"%4d %s"`: the count right-aligned in FOUR columns, then a space, then
+;; the line. Measured 2026-09-10 -- 9 prints as `   9 `, 1000 as `1000 `, and
+;; 10000 as `10000 `, so the four is a MINIMUM and the space after it is
+;; unconditional. A fixed five-wide field matches every count below 1000 and
+;; nothing at or above it, which is why the suite has a 1000-line fixture.
+;;
+;; ## uniq adds the newline a last line lacks
+;;
+;; Measured: `a\na` is three bytes in and two out -- one line, printed with a
+;; newline. Same as grep and sort, opposite of head.
+;;
+;; Capabilities: :cli/args (38), :fs/app-data (35), :io/write (37).
+(ns uniq.core (:export [main]))
+
+(defn arg [i :string] :string
+  (typed-cap-call :cli/args :string :string i))
+
+(defn emit [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn slurp-file [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn nl [] :string
+  (string-substring "a
+b" 1 2))
+
+(defn digit-text [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+(defn decimal-of [n :i64] :string
+  (if (< n 10)
+    (digit-text n)
+    (string-concat (decimal-of (quot n 10))
+                   (digit-text (- n (* 10 (quot n 10)))))))
+
+(defn pad-to [s :string width :i64] :string
+  (if (>= (string-byte-length s) width)
+    s
+    (pad-to (string-concat " " s) width)))
+
+(defn counted? [] :bool
+  (if (string=? (arg "") "2") (string=? (arg "0") "-c") false))
+
+(defn path-arg [] :string
+  (if (counted?) (arg "1") (arg "0")))
+
+(defn first-line [s :string] :string
+  (let [i (string-index-of s "\n")]
+    (if (< i 0) s (string-substring s 0 i))))
+
+(defn rest-lines [s :string] :string
+  (let [i (string-index-of s "\n")]
+    (if (< i 0) "" (string-substring s (+ i 1) (string-byte-length s)))))
+
+;; One run: the line, prefixed with its count under -c.
+(defn emit-run [line :string n :i64] :i64
+  (do
+    (if (counted?)
+      (do (emit (pad-to (decimal-of n) 4)) (emit " ") 0)
+      0)
+    (emit line)
+    (emit (nl))
+    0))
+
+;; Walk the remaining text, carrying the run in progress. PREV is the line the
+;; run is of and N how many have been seen; the run is flushed when a
+;; different line arrives, and once more at the end.
+;;
+;; `more?` is what separates "no more text" from "one more empty line":
+;; rest-lines answers "" both for `a` and for `a\n`, and both are one line.
+(defn walk [rest :string prev :string n :i64] :i64
+  (if (= (string-byte-length rest) 0)
+    (emit-run prev n)
+    (let [line (first-line rest)
+          more (rest-lines rest)]
+      (if (string=? line prev)
+        (walk more prev (+ n 1))
+        (do (emit-run prev n) (walk more line 1))))))
+
+(defn main [] :i64
+  (let [text (slurp-file (path-arg))]
+    (if (= (string-byte-length text) 0)
+      0
+      (walk (rest-lines text) (first-line text) 1))))
