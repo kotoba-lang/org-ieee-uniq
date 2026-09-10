@@ -90,6 +90,36 @@ These cases were first written against a fixture named `dups`, which does not
 exist. They passed — both implementations reported the same missing file,
 wrote nothing, and agreed. Now they use `adj`, which does.
 
+## `-d`, `-u` and `-i`
+
+```
+-d   only lines that appeared MORE than once, one copy each
+-u   only lines that appeared exactly once
+-i   compare folded, print the first occurrence verbatim
+```
+
+`-d` and `-u` partition a file between them and neither is the whole of it —
+over runs of 2, 1, 3 and 1, `-d` answers two lines and `-u` answers two
+different ones. Both print **one** copy, not n.
+
+`-i` folds for the COMPARISON only: over `A a B` it answers `A` and `B`, not
+`a`. Folding is **ASCII A–Z only** — BSD `uniq -i` folds non-ASCII under this
+locale and this does not, the same boundary
+[`org-ieee-grep`](https://github.com/kotoba-lang/org-ieee-grep) draws for its
+own `-i`.
+
+Controls, each failing only its own cases: making `-d` keep every run fails 4
+(`all` and `empty` survive correctly — for an all-duplicate file every run
+*is* a repeat); making `-u` keep repeats instead fails a different 4; and
+switching the fold off fails exactly the 2 `-i` cases.
+
+### One flag index, not one per flag
+
+`first-operand` keyed off `-c` alone, so every newly added flag had its
+operand index wrong — `-d` was read as the input path and all thirteen new
+cases failed identically at exit 1 while `-c` kept working. A uniform failure
+across every new case, with the old ones green, is what that looks like.
+
 ## What this is not
 
 No `-d`, `-u`, `-i`, `-f`, `-s`, no reading standard input — with no operand

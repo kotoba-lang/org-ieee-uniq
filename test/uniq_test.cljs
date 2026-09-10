@@ -53,6 +53,10 @@
    "nonl"     "a\na"
    ;; Blank lines are lines, and two of them are a run of two.
    "blanks"   "a\n\n\nb\n"
+   ;; Runs of 2, 1, 3 and 1 -- so -d and -u each take a proper subset.
+   "mixed"    "a\na\nb\nc\nc\nc\nd\n"
+   ;; Case differing WITHIN a run, for -i.
+   "case"     "A\na\nB\n"
    ;; The -c field boundary. `"%4d "` and a fixed five-wide field agree on
    ;; every count below 1000 and differ at it -- measured, 9 prints as
    ;; `   9 `, 1000 as `1000 ` and 10000 as `10000 `, so the four is a
@@ -77,6 +81,20 @@
    ;; file, wrote nothing, and agreed. A destination case whose input does
    ;; not exist tests nothing about destinations.
    ["adj" "OUT"] ["-c" "adj" "OUT"] ["blanks" "OUT"]
+   ;; --- -d, -u and -i ---------------------------------------------------
+   ;; -d keeps only runs LONGER than one, -u only runs of exactly one, and
+   ;; both print ONE copy rather than n. `mixed` has runs of 2, 1, 3 and 1,
+   ;; so the two flags partition it and neither is the whole file.
+   ["-d" "mixed"] ["-u" "mixed"] ["-c" "mixed"]
+   ["-d" "adj"] ["-u" "adj"] ["-d" "none"] ["-u" "none"]
+   ["-d" "all"] ["-u" "all"]
+   ;; Empty input under each.
+   ["-d" "empty"] ["-u" "empty"]
+   ;; -i compares folded but prints the FIRST occurrence verbatim: over
+   ;; `A a B` uniq answers `A` and `B`, not `a`.
+   ["-i" "case"] ["-c" "case"] ["-d" "case"]
+   ;; -i to a destination file.
+   ["-i" "case" "OUT"]
    ;; An empty input still creates the destination, empty.
    ["empty" "OUT"]
    ;; No trailing newline on the input.
