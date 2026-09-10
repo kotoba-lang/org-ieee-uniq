@@ -66,7 +66,27 @@
    ;; A MISSING operand: matched on stderr and exit status since wire 35
    ;; gained an EXISTS form. Every utility words this differently --
    ;; measured on each, not copied from a sibling.
-   ["missing"]])
+   ["missing"]
+   ;; --- the second operand is a DESTINATION ----------------------------
+   ;; `uniq INPUT OUTPUT` writes the answer to OUTPUT and puts NOTHING on
+   ;; stdout. The file is compared, not just the streams -- otherwise an
+   ;; implementation that wrote nothing at all would pass, since both sides
+   ;; produce empty stdout and exit 0.
+   ;; `adj`, not a name that is not a fixture: written as "dups" first, and
+   ;; those cases PASSED -- both implementations reported the same missing
+   ;; file, wrote nothing, and agreed. A destination case whose input does
+   ;; not exist tests nothing about destinations.
+   ["adj" "OUT"] ["-c" "adj" "OUT"] ["blanks" "OUT"]
+   ;; An empty input still creates the destination, empty.
+   ["empty" "OUT"]
+   ;; No trailing newline on the input.
+   ["nonl" "OUT"]
+   ;; A missing INPUT leaves the destination untouched: not created, not
+   ;; created-and-empty. An implementation that opened the output before
+   ;; checking the input fails here and nowhere else.
+   ["missing" "OUT"]
+   ;; Three operands is a usage error, exit 1, with uniq's own usage line.
+   ["adj" "OUT" "extra"]])
 
 (when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
 (let [amu (.join path amu-home "bin" "amu")
@@ -119,21 +139,42 @@
           (when (not= 0 (:status p)) (refuse (str "package failed: " (str (:err p))))))))
     ;; Now the only thing that matters: run it.
     (let [results
-          (for [names cases]
-            (let [argv (mapv #(if (str/starts-with? % "-")
-                                %
-                                (.join path (.realpathSync fs (.join path tmp "data")) %))
-                             names)
-                  k (run exe argv {})
-                  s (run system-uniq argv {})
+          ;; `OUT` names uniq's second operand, the DESTINATION. Each
+          ;; implementation is given its own path for it, so the two runs
+          ;; cannot see each other's file and no reset is needed between
+          ;; them; the destination's name never appears in stdout or stderr,
+          ;; so giving them different ones does not weaken the comparison.
+          ;;
+          ;; The FILE is then compared, and that is the whole point of these
+          ;; cases: uniq writing to a destination puts nothing on stdout, so
+          ;; a suite comparing only the streams would pass an implementation
+          ;; that wrote nothing at all.
+          (for [[idx names] (map-indexed vector cases)]
+            (let [dir (.realpathSync fs (.join path tmp "data"))
+                  resolve (fn [tag n]
+                            (mapv #(cond (str/starts-with? % "-") %
+                                         (= % "OUT") (.join path dir (str "out-" tag "-" idx))
+                                         :else (.join path dir %))
+                                  n))
+                  ka (resolve "k" names)
+                  sa (resolve "s" names)
+                  k (run exe ka {})
+                  s (run system-uniq sa {})
+                  read-out (fn [a] (let [f (last a)]
+                                     (if (and (str/includes? f "/out-")
+                                              (.existsSync fs f))
+                                       (.toString (.readFileSync fs f) "base64")
+                                       :absent)))
                   same? (and (= (.toString (:out k) "base64") (.toString (:out s) "base64"))
                              ;; stderr too: a missing operand differs there
                              ;; and nowhere else, so a suite that compared
                              ;; only stdout and status would call it green.
                              (= (.toString (:err k) "base64") (.toString (:err s) "base64"))
-                             (= (:status k) (:status s)))]
+                             (= (:status k) (:status s))
+                             (= (read-out ka) (read-out sa)))]
               {:argv names :ok same? :kotoba (.toString (:out k) "utf8")
                :system (.toString (:out s) "utf8")
+               :wrote [(read-out ka) (read-out sa)]
                :exit [(:status k) (:status s)]}))
           bad (remove :ok results)]
       (doseq [r results]

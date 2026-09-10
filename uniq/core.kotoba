@@ -64,11 +64,16 @@ b" 1 2))
     s
     (pad-to (string-concat " " s) width)))
 
+;; This asked whether the argument COUNT was 2 until 2026-09-10, which was
+;; right only while uniq took a single operand: `uniq INPUT OUTPUT` is also
+;; two arguments and would have been read as carrying a `-c`. The question is
+;; about argument 0's shape, so that is what it asks.
 (defn counted? [] :bool
-  (if (string=? (arg "") "2") (string=? (arg "0") "-c") false))
+  (string=? (arg "0") "-c"))
 
-(defn path-arg [] :string
-  (if (counted?) (arg "1") (arg "0")))
+;; The index of the first operand, after the flag if there is one.
+(defn first-operand [] :i64
+  (if (counted?) 1 0))
 
 (defn first-line [s :string] :string
   (let [i (string-index-of s "\n")]
@@ -79,14 +84,17 @@ b" 1 2))
     (if (< i 0) "" (string-substring s (+ i 1) (string-byte-length s)))))
 
 ;; One run: the line, prefixed with its count under -c.
-(defn emit-run [line :string n :i64] :i64
-  (do
-    (if (counted?)
-      (do (emit (pad-to (decimal-of n) 4)) (emit " ") 0)
-      0)
-    (emit line)
-    (emit (nl))
-    0))
+;;
+;; This BUILDS the text rather than writing it, because uniq's second operand
+;; is an output FILE rather than another input -- so the answer has to exist
+;; as a value before its destination is known. The whole output therefore
+;; lives in one guest string, which is the same bound cat and cp work under.
+(defn run-text [line :string n :i64] :string
+  (if (counted?)
+    (string-concat
+      (string-concat (string-concat (pad-to (decimal-of n) 4) " ") line)
+      (nl))
+    (string-concat line (nl))))
 
 ;; Walk the remaining text, carrying the run in progress. PREV is the line the
 ;; run is of and N how many have been seen; the run is flushed when a
@@ -94,26 +102,64 @@ b" 1 2))
 ;;
 ;; `more?` is what separates "no more text" from "one more empty line":
 ;; rest-lines answers "" both for `a` and for `a\n`, and both are one line.
-(defn walk [rest :string prev :string n :i64] :i64
+(defn walk [rest :string prev :string n :i64 acc :string] :string
   (if (= (string-byte-length rest) 0)
-    (emit-run prev n)
+    (string-concat acc (run-text prev n))
     (let [line (first-line rest)
           more (rest-lines rest)]
       (if (string=? line prev)
-        (walk more prev (+ n 1))
-        (do (emit-run prev n) (walk more line 1))))))
+        (walk more prev (+ n 1) acc)
+        (walk more line 1 (string-concat acc (run-text prev n)))))))
 
+(defn spit-file [path :string content :string] :string
+  (typed-cap-call :fs/app-data :string :string
+                  (string-concat (string-concat path "WRITE_SEP") content)))
+
+(defn complain [path :string] :i64
+  (do
+    (emit-error "uniq: ")
+    (emit-error path)
+    (emit-error ": No such file or directory")
+    (emit-error (nl))
+    1))
+
+;; Verbatim from /usr/bin/uniq, measured 2026-09-10. Three or more operands
+;; is a usage error, exit 1.
+(defn usage [] :i64
+  (do
+    (emit-error "usage: uniq [-cdiu] [-D[septype]] [-f fields] [-s chars] [input [output]]")
+    (emit-error (nl))
+    1))
+
+;; --- the second operand is a DESTINATION ---------------------------------
+;;
+;; `uniq INPUT OUTPUT` writes the answer to OUTPUT and puts NOTHING on
+;; stdout, truncating OUTPUT if it exists. Measured 2026-09-10. That makes
+;; uniq the only command here whose extra operand is not another input, and
+;; the reason its walk builds a string instead of writing as it goes.
+;;
+;; A missing INPUT leaves OUTPUT untouched -- it is not created and then
+;; found empty -- because the input is checked before anything is written.
 (defn main [] :i64
-  (let [path (path-arg)]
-    (if (readable? path)
-      (let [text (slurp-file path)]
-        (if (= (string-byte-length text) 0)
-          0
-          (walk (rest-lines text) (first-line text) 1)))
-      ;; `uniq: PATH: No such file or directory`, exit 1.
-      (do
-        (emit-error "uniq: ")
-        (emit-error path)
-        (emit-error ": No such file or directory")
-        (emit-error (nl))
-        1))))
+  (let [total (arg "")
+        start (first-operand)]
+    (if (string=? (decimal-of start) total)
+      ;; No operand. POSIX reads standard input; there is no stdin
+      ;; capability, so this refuses rather than pretending to have read an
+      ;; empty one.
+      1
+      (if (if (string=? (decimal-of (+ start 1)) total)
+            false
+            (if (string=? (decimal-of (+ start 2)) total) false true))
+        (usage)
+        (let [input (arg (decimal-of start))
+              to-file? (string=? (decimal-of (+ start 2)) total)]
+          (if (readable? input)
+            (let [text (slurp-file input)
+                  out (if (= (string-byte-length text) 0)
+                        ""
+                        (walk (rest-lines text) (first-line text) 1 ""))]
+              (if to-file?
+                (do (spit-file (arg (decimal-of (+ start 1))) out) 0)
+                (do (emit out) 0)))
+            (complain input)))))))

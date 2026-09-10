@@ -58,7 +58,39 @@ bisection.
 arena, the pair heap, the grant and the filesystem scope are all constants of
 the packaged binary.
 
+## The second operand is a DESTINATION
+
+`uniq INPUT OUTPUT` writes the answer to OUTPUT and puts **nothing** on
+stdout, truncating OUTPUT if it exists. Measured 2026-09-10. That makes uniq
+the only command here whose extra operand is not another input — and the
+reason its walk builds a string rather than writing as it goes: the answer
+has to exist as a value before its destination is known. The whole output
+therefore lives in one guest string, the same bound `cat` and `cp` work
+under.
+
+Three or more operands is a usage error, exit 1, with uniq's own usage line.
+
+### The file is compared, not just the streams
+
+Both sides produce empty stdout and exit 0 when writing to a destination, so
+a suite comparing only the streams would pass an implementation that wrote
+**nothing at all**. The control says exactly that: never writing the
+destination fails all five cases that have one — including `empty OUT`, so
+creating an empty destination is genuinely checked — while correctly leaving
+`missing OUT` passing.
+
+A missing INPUT leaves the destination untouched: not created, and not
+created-then-empty, because the input is checked first. Creating the
+destination before that check fails exactly one case, `missing OUT`, and no
+other.
+
+### A destination case whose input does not exist tests nothing
+
+These cases were first written against a fixture named `dups`, which does not
+exist. They passed — both implementations reported the same missing file,
+wrote nothing, and agreed. Now they use `adj`, which does.
+
 ## What this is not
 
-One operand. No `-d`, `-u`, `-i`, `-f`, `-s`, no second (output) operand, no
-reading standard input.
+No `-d`, `-u`, `-i`, `-f`, `-s`, no reading standard input — with no operand
+this exits 1 rather than pretending to have read an empty one.
