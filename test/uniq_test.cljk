@@ -1,4 +1,4 @@
-;; test/uniq_test.cljs — build the command and compare it with the system
+;; test/uniq_test.cljk — build the command and compare it with the system
 ;; uniq, byte for byte.
 ;;
 ;; No locale here: uniq compares lines for EQUALITY, not order, so it has no
