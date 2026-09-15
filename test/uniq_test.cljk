@@ -12,7 +12,9 @@
 
 (defn- run [cmd args opts]
   (let [r (.spawnSync cp cmd (clj->js args)
-                      (clj->js (merge {:encoding "buffer"} opts)))]
+                      ;; The large fixture answers 3 MB; Node's default 1 MiB
+                      ;; maxBuffer would kill the child and call it a difference.
+                      (clj->js (merge {:encoding "buffer" :maxBuffer 67108864} opts)))]
     {:status (.-status r) :out (.-stdout r) :err (.-stderr r)}))
 
 (defn- refuse [message]
@@ -51,6 +53,12 @@
    "one"      "one\n"
    ;; No trailing newline: uniq ADDS one. Three bytes in, two out.
    "nonl"     "a\na"
+   ;; An unterminated last line that is its OWN run. `a\na` above merges into
+   ;; the first line's run and inherits that line's newline, so it cannot
+   ;; tell "the newline uniq adds" from "the newline the first line had".
+   ;; Measured 2026-09-15: /usr/bin/uniq answers `a\nb` -- three bytes, no
+   ;; newline added -- and with -c the same shape.
+   "nonl2"    "a\nb"
    ;; Blank lines are lines, and two of them are a run of two.
    "blanks"   "a\n\n\nb\n"
    ;; Runs of 2, 1, 3 and 1 -- so -d and -u each take a proper subset.
@@ -61,12 +69,19 @@
    ;; every count below 1000 and differ at it -- measured, 9 prints as
    ;; `   9 `, 1000 as `1000 ` and 10000 as `10000 `, so the four is a
    ;; MINIMUM. This fixture is why the width is tested rather than assumed.
-   "thousand" :thousand-lines})
+   "thousand" :thousand-lines
+   ;; A LARGE file: 80,000 lines, 3.4 MB, in runs of one to four so every
+   ;; flag has work. The previous core.kotoba built the whole answer by
+   ;; copying its accumulator per run and trapped at 800 KB (measured
+   ;; 2026-09-15); this is the case that pins the string builder.
+   "big"      :big-lines})
 
 (def cases
-  [["adj"] ["none"] ["all"] ["empty"] ["one"] ["nonl"] ["blanks"] ["thousand"]
+  [["adj"] ["none"] ["all"] ["empty"] ["one"] ["nonl"] ["nonl2"] ["blanks"] ["thousand"]
    ["-c" "adj"] ["-c" "none"] ["-c" "all"] ["-c" "empty"] ["-c" "one"]
-   ["-c" "nonl"] ["-c" "blanks"] ["-c" "thousand"]
+   ["-c" "nonl"] ["-c" "nonl2"] ["-c" "blanks"] ["-c" "thousand"]
+   ;; The large file under every flag, and written to the OUTPUT operand.
+   ["big"] ["-c" "big"] ["-d" "big"] ["-u" "big"] ["-i" "big"] ["big" "OUT"] ["-c" "big" "OUT"]
    ;; A MISSING operand: matched on stderr and exit status since wire 35
    ;; gained an EXISTS form. Every utility words this differently --
    ;; measured on each, not copied from a sibling.
@@ -98,7 +113,7 @@
    ;; An empty input still creates the destination, empty.
    ["empty" "OUT"]
    ;; No trailing newline on the input.
-   ["nonl" "OUT"]
+   ["nonl" "OUT"] ["nonl2" "OUT"]
    ;; A missing INPUT leaves the destination untouched: not created, not
    ;; created-and-empty. An implementation that opened the output before
    ;; checking the input fails here and nowhere else.
@@ -108,7 +123,11 @@
 
 (when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
 (let [amu (.join path amu-home "bin" "amu")
-      packager (.join path amu-home "scripts" "package-command.cljs")]
+      ;; `.cljk`, run through amu's own kbb: the `.cljs` spelling this named
+      ;; until 2026-09-15 no longer exists (the cljk rename), so the suite
+      ;; could not have run since.
+      packager (.join path amu-home "scripts" "package-command.cljk")
+      kbb (.join path amu-home "bin" "kbb")]
   (when-not (.existsSync fs amu) (refuse (str "no amu at " amu)))
   (when-not (.existsSync fs packager) (refuse (str "no packager at " packager)))
   (when-not (.existsSync fs system-uniq) (refuse (str "no " system-uniq " to compare against")))
@@ -126,8 +145,20 @@
       (.mkdirSync fs data)
       (doseq [[name content] fixtures]
         (.writeFileSync fs (.join path data name)
-                        (if (= content :thousand-lines)
-                          (.repeat "q\n" 1000)
+                        (case content
+                          :thousand-lines (.repeat "q\n" 1000)
+                          ;; Groups of three equal lines; every fifth group
+                          ;; spells its second line in capitals, so -i has
+                          ;; something to fold and the others have a run
+                          ;; boundary there.
+                          :big-lines (str/join "" (map (fn [i]
+                                                         (let [g (quot i 3)
+                                                               line (str "line " g " of the corpus, group " (mod g 4))]
+                                                           (str (if (and (= 0 (mod g 5)) (= 1 (mod i 3)))
+                                                                  (str/upper-case line)
+                                                                  line)
+                                                                "\n")))
+                                                       (range 80000)))
                           content)
                         "utf8")))
     (let [c (run "node" [amu "compile" src "--target" "aarch64-macos" "--jvm-free"
@@ -148,8 +179,12 @@
       ;; here rather than supplied at run time. Counting words walks one code
       ;; point at a time, so the guest recursion is as long as the file and
       ;; the default 512 fuel counts almost nothing.
-      (doseq [[out extra] [[exe ["--fuel" "50000000" "--string-pool" "8000000" "--pairs" "200000"]]]]
-        (let [p (run "nbb" (into [packager "--code" blob "--offset" offset "--isa" "aarch64"
+      ;; Budgets for the large fixture: about ten handles per line, the text
+      ;; plus the answer in the pool, and more than a second of CPU on a
+      ;; loaded machine.
+      (doseq [[out extra] [[exe ["--fuel" "500000000" "--string-pool" "67108864" "--pairs" "4194304"
+                                 "--cpu-seconds" "60" "--wall-seconds" "600"]]]]
+        (let [p (run "node" (into [kbb "--backend" "sci" packager "--code" blob "--offset" offset "--isa" "aarch64"
                                   "--allow" "35,37,38,39"
                                   "--fs-scope" (.realpathSync fs (.join path tmp "data"))
                                   "--output" out]

@@ -19,6 +19,21 @@
 ;; Measured: `a\na` is three bytes in and two out -- one line, printed with a
 ;; newline. Same as grep and sort, opposite of head.
 ;;
+;; ## The output is written as it goes, or built at the pool's tail
+;;
+;; Until 2026-09-15 the walk built the whole answer by `(string-concat acc
+;; run)`, which copied the accumulator at every run: measured, a 13,000-line
+;; 800 KB file exhausted the pool and trapped. To stdout the answer is now
+;; WRITTEN run by run, and nothing accumulates. To the OUTPUT operand it is
+;; still one value, built with the loader's tail append: `string-concat`
+;; copies only its second operand when the first is the pool's last
+;; allocation, so an accumulator kept at the tail grows by the bytes
+;; appended. Keeping it there is a discipline: only VIEWS are appended (a
+;; line of the input, a literal, one digit at a time -- never a freshly
+;; concatenated piece), and no capability call happens between appends,
+;; since every wire answer is interned in the pool and moves the tail. The
+;; flags are therefore read once into MODE and carried, not re-asked.
+;;
 ;; Capabilities: :cli/args (38), :fs/app-data (35), :io/write (37).
 (ns uniq.core (:export [main]))
 
@@ -59,10 +74,24 @@ b" 1 2))
     (string-concat (decimal-of (quot n 10))
                    (digit-text (- n (* 10 (quot n 10)))))))
 
-(defn pad-to [s :string width :i64] :string
-  (if (>= (string-byte-length s) width)
-    s
-    (pad-to (string-concat " " s) width)))
+;; --- appending onto a tail accumulator ------------------------------------
+;; Every helper here takes ACC and answers ACC with more appended, one view
+;; at a time, so the accumulator never leaves the pool's tail.
+(defn digit-count [n :i64] :i64
+  (if (< n 10) 1 (+ 1 (digit-count (quot n 10)))))
+
+(defn append-spaces [acc :string k :i64] :string
+  (if (<= k 0) acc (append-spaces (string-concat acc " ") (- k 1))))
+
+(defn append-digits [acc :string n :i64] :string
+  (if (< n 10)
+    (string-concat acc (digit-text n))
+    (string-concat (append-digits acc (quot n 10))
+                   (digit-text (- n (* 10 (quot n 10)))))))
+
+;; `"%4d "`: the count right-aligned in four columns, then a space.
+(defn append-count [acc :string n :i64] :string
+  (string-concat (append-digits (append-spaces acc (- 4 (digit-count n))) n) " "))
 
 ;; This asked whether the argument COUNT was 2 until 2026-09-10, which was
 ;; right only while uniq took a single operand: `uniq INPUT OUTPUT` is also
@@ -71,18 +100,6 @@ b" 1 2))
 (defn flag [] :string
   (let [a (arg "0")]
     (if (= (string-index-of a "-") 0) a "")))
-
-(defn counted? [] :bool
-  (string=? (flag) "-c"))
-
-(defn dupes-only? [] :bool
-  (string=? (flag) "-d"))
-
-(defn singles-only? [] :bool
-  (string=? (flag) "-u"))
-
-(defn folding? [] :bool
-  (string=? (flag) "-i"))
 
 ;; --- ASCII case folding, for -i ------------------------------------------
 ;; There is no case-folding builtin, so this folds A-Z only. Measured: BSD
@@ -102,13 +119,6 @@ b" 1 2))
            (fold-cp (string-code-point-at b i)))
       (folded-eq a b (+ i 1) n)
       false)))
-
-(defn same-line? [a :string b :string] :bool
-  (if (folding?)
-    (if (= (string-byte-length a) (string-byte-length b))
-      (folded-eq a b 0 (string-byte-length a))
-      false)
-    (string=? a b)))
 
 ;; The index of the first operand, after the flag if there is one.
 (defn first-operand [] :i64
@@ -133,32 +143,67 @@ b" 1 2))
 ;; lives in one guest string, which is the same bound cat and cp work under.
 ;; A run of n copies. -d keeps only runs longer than one and -u only runs of
 ;; exactly one; both print ONE copy, not n.
-(defn run-wanted? [n :i64] :bool
-  (if (dupes-only?)
-    (> n 1)
-    (if (singles-only?) (= n 1) true)))
+;; MODE: 0 plain, 1 -c, 2 -d, 3 -u, 4 -i; plus 8 when the answer goes to
+;; the OUTPUT operand rather than stdout; plus 16 when the run's FIRST line
+;; was newline-terminated in the input, which is when the run is written
+;; with a newline. /usr/bin/uniq does not terminate an unterminated last
+;; line (measured 2026-09-15: `a\nb` is three bytes in and three out, with
+;; -c too, where this had answered four), and the fixture `a\na` had hidden
+;; it: that run's first line is terminated, so its newline is real.
+(defn mode-of [] :i64
+  (let [f (flag)]
+    (if (string=? f "-c") 1
+        (if (string=? f "-d") 2
+            (if (string=? f "-u") 3
+                (if (string=? f "-i") 4 0))))))
 
-(defn run-text [line :string n :i64] :string
-  (if (counted?)
-    (string-concat
-      (string-concat (string-concat (pad-to (decimal-of n) 4) " ") line)
-      (nl))
-    (if (run-wanted? n) (string-concat line (nl)) "")))
+(defn run-wanted? [n :i64 mode :i64] :bool
+  (if (= mode 2)
+    (> n 1)
+    (if (= mode 3) (= n 1) true)))
+
+;; One run onto ACC (file mode), or onto stdout (ACC untouched).
+(defn eol [mode :i64] :string
+  (if (>= mode 16) (nl) (string-substring "x" 0 0)))
+
+(defn put-run [acc :string line :string n :i64 mode :i64] :string
+  (let [m (- mode (* 16 (quot mode 16)))]
+    (if (>= m 8)
+      (if (= m 9)
+        (string-concat (string-concat (append-count acc n) line) (eol mode))
+        (if (run-wanted? n (- m 8)) (string-concat (string-concat acc line) (eol mode)) acc))
+      (if (= m 1)
+        (do (emit (append-count (string-substring "x" 0 0) n)) (emit line) (emit (eol mode)) acc)
+        (if (run-wanted? n m) (do (emit line) (emit (eol mode)) acc) acc)))))
+
+(defn same-line-mode? [a :string b :string mode :i64] :bool
+  (if (= (- mode (* 8 (quot mode 8))) 4)
+    (if (= (string-byte-length a) (string-byte-length b))
+      (folded-eq a b 0 (string-byte-length a))
+      false)
+    (string=? a b)))
 
 ;; Walk the remaining text, carrying the run in progress. PREV is the line the
-;; run is of and N how many have been seen; the run is flushed when a
-;; different line arrives, and once more at the end.
+;; run is of and N how many have been seen; the run is put when a different
+;; line arrives, and once more at the end.
 ;;
 ;; `more?` is what separates "no more text" from "one more empty line":
 ;; rest-lines answers "" both for `a` and for `a\n`, and both are one line.
-(defn walk [rest :string prev :string n :i64 acc :string] :string
+;; MODE's +16 says whether PREV -- the run's first line -- was terminated.
+;; A line is terminated exactly when a newline follows it in REST, which is
+;; what separates "no more text" from "one more unterminated line".
+(defn walk [rest :string prev :string n :i64 acc :string mode :i64] :string
   (if (= (string-byte-length rest) 0)
-    (string-concat acc (run-text prev n))
-    (let [line (first-line rest)
-          more (rest-lines rest)]
-      (if (same-line? line prev)
-        (walk more prev (+ n 1) acc)
-        (walk more line 1 (string-concat acc (run-text prev n)))))))
+    (put-run acc prev n mode)
+    (let [i (string-index-of rest "\n")
+          line (if (< i 0) rest (string-substring rest 0 i))
+          more (if (< i 0) (string-substring rest 0 0)
+                   (string-substring rest (+ i 1) (string-byte-length rest)))
+          base (- mode (* 16 (quot mode 16)))]
+      (if (same-line-mode? line prev mode)
+        (walk more prev (+ n 1) acc mode)
+        (walk more line 1 (put-run acc prev n mode)
+              (+ base (if (< i 0) 0 16)))))))
 
 (defn spit-file [path :string content :string] :string
   (typed-cap-call :fs/app-data :string :string
@@ -204,11 +249,18 @@ b" 1 2))
         (let [input (arg (decimal-of start))
               to-file? (string=? (decimal-of (+ start 2)) total)]
           (if (readable? input)
-            (let [text (slurp-file input)
-                  out (if (= (string-byte-length text) 0)
+            (let [base (+ (mode-of) (if to-file? 8 0))
+                  ;; Read AFTER the flag: the text is then the pool's last
+                  ;; allocation until the accumulator's first append.
+                  text (slurp-file input)
+                  n (string-byte-length text)
+                  first-end (string-index-of text "\n")
+                  out (if (= n 0)
                         ""
-                        (walk (rest-lines text) (first-line text) 1 ""))]
+                        (walk (rest-lines text) (first-line text) 1
+                              (string-substring "x" 0 0)
+                              (+ base (if (< first-end 0) 0 16))))]
               (if to-file?
                 (do (spit-file (arg (decimal-of (+ start 1))) out) 0)
-                (do (emit out) 0)))
+                0))
             (complain input)))))))
