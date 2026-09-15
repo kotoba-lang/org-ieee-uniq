@@ -23,13 +23,19 @@ the same kind of boundary; this one costs a thousand.)
 
 ## Measured against the system utility
 
-Sixteen cases, all byte-identical. No locale: `uniq` compares lines for
+Forty-nine cases, all byte-identical. No locale: `uniq` compares lines for
 **equality**, not order, so it has no collation to disagree about — and for
 the same reason it needed no ordering primitive, `string=` being the whole
 comparison.
 
-`uniq` **adds** the newline a last line lacks: `a\na` is three bytes in and
-two out. Same as `grep` and `sort`, opposite of `head`.
+`uniq` does **not** add a newline to an unterminated last line. Measured
+2026-09-15: `a\nb` is three bytes in and three out, with `-c` too. This
+README said the opposite until then, from the fixture `a\na` — three bytes
+in, two out — whose one run *inherits* the first line's newline, so it could
+not tell the newline uniq adds from the newline the input had. A run is
+written with a newline exactly when its **first** line was terminated;
+`nonl2` (`a\nb`, alone, with `-c`, and to the output operand) is the case
+that separates the two, and the previous guest fails all three.
 
 Verified to fail as well as pass: collapsing *all* duplicates rather than
 adjacent ones fails two cases, padding `-c` to a fixed five fails three, and
@@ -51,6 +57,26 @@ last fixed arena in the loader; it is a per-run budget now (`--pairs`,
 
 The report naming the arena is what made that one measurement instead of a
 bisection.
+
+## The output is written as it goes, or built at the pool's tail (2026-09-15)
+
+The walk built the whole answer by `(string-concat acc run)`, copying the
+accumulator at every run — quadratic in the pool. Measured: a 13,000-line,
+800 KB file trapped. To stdout the answer is now **written run by run** and
+nothing accumulates. To the output operand it is still one value (the write
+wire takes the whole content), built with the loader's **tail append**:
+`string-concat` copies only its second operand when the first is the pool's
+last allocation (amu, 2026-09-15), so an accumulator kept at the tail grows
+by the bytes appended. That is a discipline in the guest — append only
+views (a line of the input, a literal, one digit at a time), and make no
+capability call between appends, since every wire answer is interned in the
+pool and moves the tail — and the flags are read once into `mode` for that
+reason.
+
+Measured on a 33 MB file (769,400 lines), CPU seconds, identical output to
+`/usr/bin/uniq`: plain 0.58 s, `-c` 0.75 s, `-d` 0.41, `-u` 0.56, `-i` 0.59;
+`/usr/bin/uniq -c` 0.18 s. The suite's 80,000-line fixture runs every flag
+and the output operand.
 
 ## Capabilities
 
