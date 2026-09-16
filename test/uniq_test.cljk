@@ -119,7 +119,19 @@
    ;; checking the input fails here and nowhere else.
    ["missing" "OUT"]
    ;; Three operands is a usage error, exit 1, with uniq's own usage line.
-   ["adj" "OUT" "extra"]])
+   ["adj" "OUT" "extra"]
+   ;; --- standard input (wire 41, 2026-09-16) ---------------------------
+   ;; 99% of uniq's invocations in agent tool use are a later pipeline
+   ;; segment (1,933 of 1,951 measured); `sort | uniq` alone is 1,889.
+   {:argv [] :stdin "adj"}
+   {:argv ["-c"] :stdin "adj"}
+   {:argv ["-d"] :stdin "adj"}
+   {:argv ["-u"] :stdin "adj"}
+   {:argv ["-i"] :stdin "case"}
+   {:argv [] :stdin "none"}
+   {:argv [] :stdin "all"}
+   {:argv [] :stdin "empty"}
+   {:argv [] :stdin "nonl"}])
 
 (when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
 (let [amu (.join path amu-home "bin" "amu")
@@ -138,7 +150,7 @@
         blob (.join path tmp "uniq.bin")
         exe (.join path tmp "uniq")
         exe-big (.join path tmp "uniq-big")]
-    (.writeFileSync fs policy "{:allow #{[:cap/call 35] [:cap/call 37] [:cap/call 38] [:cap/call 39]}}" "utf8")
+    (.writeFileSync fs policy "{:allow #{[:cap/call 35] [:cap/call 37] [:cap/call 38] [:cap/call 39] [:cap/call 41]}}" "utf8")
     ;; The fixtures live in the tree the binary is packaged for. The native
     ;; loader refuses a relative request outright, so operands are absolute.
     (let [data (.join path tmp "data")]
@@ -185,7 +197,7 @@
       (doseq [[out extra] [[exe ["--fuel" "500000000" "--string-pool" "67108864" "--pairs" "4194304"
                                  "--cpu-seconds" "60" "--wall-seconds" "600"]]]]
         (let [p (run "node" (into [kbb "--backend" "sci" packager "--code" blob "--offset" offset "--isa" "aarch64"
-                                  "--allow" "35,37,38,39"
+                                  "--allow" "35,37,38,39,41"
                                   "--fs-scope" (.realpathSync fs (.join path tmp "data"))
                                   "--output" out]
                                  extra) {})]
@@ -202,8 +214,16 @@
           ;; cases: uniq writing to a destination puts nothing on stdout, so
           ;; a suite comparing only the streams would pass an implementation
           ;; that wrote nothing at all.
-          (for [[idx names] (map-indexed vector cases)]
-            (let [dir (.realpathSync fs (.join path tmp "data"))
+          (for [[idx case] (map-indexed vector cases)]
+            (let [names (if (map? case) (:argv case) case)
+                  ;; A map case names a fixture fed as standard input to BOTH
+                  ;; binaries; as a Buffer, since spawnSync applies :encoding
+                  ;; "buffer" to a string input and node refuses it.
+                  input (when (map? case)
+                          (or (get fixtures (:stdin case))
+                              (refuse (str "no fixture " (:stdin case) " for a stdin case"))))
+                  opts (if input {:input (js/Buffer.from input "utf8")} {})
+                  dir (.realpathSync fs (.join path tmp "data"))
                   resolve (fn [tag n]
                             (mapv #(cond (str/starts-with? % "-") %
                                          (= % "OUT") (.join path dir (str "out-" tag "-" idx))
@@ -211,10 +231,11 @@
                                   n))
                   ka (resolve "k" names)
                   sa (resolve "s" names)
-                  k (run exe ka {})
-                  s (run system-uniq sa {})
+                  k (run exe ka opts)
+                  s (run system-uniq sa opts)
                   read-out (fn [a] (let [f (last a)]
-                                     (if (and (str/includes? f "/out-")
+                                     ;; `f` is nil for a stdin case with no argv.
+                                     (if (and f (str/includes? f "/out-")
                                               (.existsSync fs f))
                                        (.toString (.readFileSync fs f) "base64")
                                        :absent)))
@@ -225,7 +246,8 @@
                              (= (.toString (:err k) "base64") (.toString (:err s) "base64"))
                              (= (:status k) (:status s))
                              (= (read-out ka) (read-out sa)))]
-              {:argv names :ok same? :kotoba (.toString (:out k) "utf8")
+              {:argv (if (map? case) [(:argv case) :stdin (:stdin case)] names)
+               :ok same? :kotoba (.toString (:out k) "utf8")
                :system (.toString (:out s) "utf8")
                :wrote [(read-out ka) (read-out sa)]
                :exit [(:status k) (:status s)]}))

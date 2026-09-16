@@ -177,7 +177,14 @@ operand index wrong — `-d` was read as the input path and all thirteen new
 cases failed identically at exit 1 while `-c` kept working. A uniform failure
 across every new case, with the old ones green, is what that looks like.
 
+## Standard input
+
+With no operand `uniq` reads standard input (wire 41 `:io/read`, 2026-09-16)
+— 99% of how it is invoked in agent tool use (1,933 of 1,951 over 1,268,018
+measured Bash calls; `sort | uniq` alone is 1,889). Whole-input form: input
+larger than the binary's string pool is refused (exit 120), never answered
+short.
+
 ## What this is not
 
-No `-d`, `-u`, `-i`, `-f`, `-s`, no reading standard input — with no operand
-this exits 1 rather than pretending to have read an empty one.
+No `-f`, `-s` (`-c`, `-d`, `-u`, `-i` landed since this was first written).
