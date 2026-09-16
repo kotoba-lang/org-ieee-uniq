@@ -173,16 +173,17 @@ b" 1 2))
 ;; times two, plus one when a newline ended it. A region: the newline
 ;; needle is a literal, a handle each time it is evaluated.
 (defn line-end [text :string pos :i64] :i64
-  (let [k (arena-scope (string-index-of-from text "\n" pos))]
+  (let [k (string-find-byte text 10 pos)]
     (if (< k 0) (* 2 (string-byte-length text)) (+ (* 2 (+ k 1)) 1))))
 
 ;; The run's line, from PREV up to and including its newline when TERM.
 ;; /usr/bin/uniq does not terminate an unterminated last line (measured
 ;; 2026-09-15: `a\nb` is three bytes in and three out, with -c too).
-(defn run-line [text :string pp :i64] :string
+;; Appended as a RANGE (`string-append-range`, context ABI v10): no view.
+(defn append-run-line [acc :string text :string pp :i64] :string
   (let [prev (pp-prev pp)
         e (i64-shift-right (line-end text prev) 1)]
-    (string-substring text prev (if (pp-term? pp) e (- e 0)))))
+    (string-append-range acc text prev e)))
 
 ;; One run of N copies onto ACC: -c prefixes the count, -d keeps only runs
 ;; longer than one and -u only runs of exactly one; both print ONE copy.
@@ -190,8 +191,8 @@ b" 1 2))
   (let [n (i64-shift-right nm 6)
         m (bit-and nm 7)]
     (if (= m 1)
-      (string-concat (append-count acc n) (run-line text pp))
-      (if (run-wanted? n m) (string-concat acc (run-line text pp)) acc))))
+      (append-run-line (append-count acc n) text pp)
+      (if (run-wanted? n m) (append-run-line acc text pp) acc))))
 
 (defn same-line? [folded :string prev :i64 pos :i64] :bool
   (= 0 (string-compare-lines folded prev folded pos)))
