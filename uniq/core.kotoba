@@ -102,23 +102,17 @@ b" 1 2))
     (if (= (string-index-of a "-") 0) a "")))
 
 ;; --- ASCII case folding, for -i ------------------------------------------
-;; There is no case-folding builtin, so this folds A-Z only. Measured: BSD
-;; uniq -i folds non-ASCII under this locale and this does not, which the
-;; README names rather than claiming full folding -- the same boundary
-;; org-ieee-grep draws for its own -i.
+;; `string-fold-ascii` (context ABI v7) folds A-Z only, over the WHOLE text
+;; once: one byte to one byte, so an offset into the fold is the same
+;; offset into the original -- the comparison reads the fold and the
+;; output the original. Measured: BSD uniq -i folds non-ASCII under this
+;; locale and this does not, which the README names rather than claiming
+;; full folding -- the same boundary org-ieee-grep draws for its own -i.
 ;;
 ;; The comparison folds; the OUTPUT does not. Measured: `uniq -i` over
 ;; `A a B` answers `A` and `B`, the first occurrence of each run verbatim.
-(defn fold-cp [c :i64] :i64
-  (if (< c 65) c (if (> c 90) c (+ c 32))))
-
-(defn folded-eq [a :string b :string i :i64 n :i64] :bool
-  (if (>= i n)
-    true
-    (if (= (fold-cp (string-code-point-at a i))
-           (fold-cp (string-code-point-at b i)))
-      (folded-eq a b (+ i 1) n)
-      false)))
+(defn fold [s :string] :string
+  (string-fold-ascii s))
 
 ;; The index of the first operand, after the flag if there is one.
 (defn first-operand [] :i64
@@ -126,14 +120,6 @@ b" 1 2))
   ;; flag's operand index wrong -- `-d` was read as the input path, so all
   ;; thirteen new cases failed identically at exit 1 while `-c` kept working.
   (if (string=? (flag) "") 0 1))
-
-(defn first-line [s :string] :string
-  (let [i (string-index-of s "\n")]
-    (if (< i 0) s (string-substring s 0 i))))
-
-(defn rest-lines [s :string] :string
-  (let [i (string-index-of s "\n")]
-    (if (< i 0) "" (string-substring s (+ i 1) (string-byte-length s)))))
 
 ;; One run: the line, prefixed with its count under -c.
 ;;
@@ -162,48 +148,99 @@ b" 1 2))
     (> n 1)
     (if (= mode 3) (= n 1) true)))
 
-;; One run onto ACC (file mode), or onto stdout (ACC untouched).
-(defn eol [mode :i64] :string
-  (if (>= mode 16) (nl) (string-substring "x" 0 0)))
-
-(defn put-run [acc :string line :string n :i64 mode :i64] :string
-  (let [m (- mode (* 16 (quot mode 16)))]
-    (if (>= m 8)
-      (if (= m 9)
-        (string-concat (string-concat (append-count acc n) line) (eol mode))
-        (if (run-wanted? n (- m 8)) (string-concat (string-concat acc line) (eol mode)) acc))
-      (if (= m 1)
-        (do (emit (append-count (string-substring "x" 0 0) n)) (emit line) (emit (eol mode)) acc)
-        (if (run-wanted? n m) (do (emit line) (emit (eol mode)) acc) acc)))))
-
-(defn same-line-mode? [a :string b :string mode :i64] :bool
-  (if (= (- mode (* 8 (quot mode 8))) 4)
-    (if (= (string-byte-length a) (string-byte-length b))
-      (folded-eq a b 0 (string-byte-length a))
-      false)
-    (string=? a b)))
-
-;; Walk the remaining text, carrying the run in progress. PREV is the line the
-;; run is of and N how many have been seen; the run is put when a different
-;; line arrives, and once more at the end.
+;; --- the walk: scalar cursors over the text (2026-09-16) ------------------
 ;;
-;; `more?` is what separates "no more text" from "one more empty line":
-;; rest-lines answers "" both for `a` and for `a\n`, and both are one line.
-;; MODE's +16 says whether PREV -- the run's first line -- was terminated.
-;; A line is terminated exactly when a newline follows it in REST, which is
-;; what separates "no more text" from "one more unterminated line".
-(defn walk [rest :string prev :string n :i64 acc :string mode :i64] :string
-  (if (= (string-byte-length rest) 0)
-    (put-run acc prev n mode)
-    (let [i (string-index-of rest "\n")
-          line (if (< i 0) rest (string-substring rest 0 i))
-          more (if (< i 0) (string-substring rest 0 0)
-                   (string-substring rest (+ i 1) (string-byte-length rest)))
-          base (- mode (* 16 (quot mode 16)))]
-      (if (same-line-mode? line prev mode)
-        (walk more prev (+ n 1) acc mode)
-        (walk more line 1 (put-run acc prev n mode)
-              (+ base (if (< i 0) 0 16)))))))
+;; Lines are named by their byte offsets into the ONE text, never cut into
+;; views for the comparison: `string-compare-lines` (context ABI v8) answers
+;; whether the line at PREV and the line at POS are the same in place, and
+;; `string-index-of-from` finds the next newline from an offset without a
+;; view. A run of identical lines therefore costs no handle at all; a run
+;; boundary costs the run's view and its append. Until then every line was
+;; two views, a comparison over views and two or three writes.
+;;
+;; PP packs the cursor, the run's first line and whether that line was
+;; newline-terminated: `pos * 2^31 + prev * 2 + term` (the pool is at most
+;; 1 GiB, so an offset fits 30 bits). NM packs the run length and the
+;; mode: `n * 64 + mode`, MODE as `mode-of` plus 8 when the answer goes to
+;; the OUTPUT operand. A function carries five parameters.
+(defn pp-pos [pp :i64] :i64 (i64-shift-right pp 31))
+(defn pp-prev [pp :i64] :i64 (bit-and (i64-shift-right pp 1) 1073741823))
+(defn pp-term? [pp :i64] :bool (= 1 (bit-and pp 1)))
+(defn pack-pp [pos :i64 prev :i64 term? :bool] :i64
+  (+ (i64-shift-left pos 31) (i64-shift-left prev 1) (if term? 1 0)))
+
+;; Just past the line starting at POS -- past its newline, or the length --
+;; times two, plus one when a newline ended it. A region: the newline
+;; needle is a literal, a handle each time it is evaluated.
+(defn line-end [text :string pos :i64] :i64
+  (let [k (arena-scope (string-index-of-from text "\n" pos))]
+    (if (< k 0) (* 2 (string-byte-length text)) (+ (* 2 (+ k 1)) 1))))
+
+;; The run's line, from PREV up to and including its newline when TERM.
+;; /usr/bin/uniq does not terminate an unterminated last line (measured
+;; 2026-09-15: `a\nb` is three bytes in and three out, with -c too).
+(defn run-line [text :string pp :i64] :string
+  (let [prev (pp-prev pp)
+        e (i64-shift-right (line-end text prev) 1)]
+    (string-substring text prev (if (pp-term? pp) e (- e 0)))))
+
+;; One run of N copies onto ACC: -c prefixes the count, -d keeps only runs
+;; longer than one and -u only runs of exactly one; both print ONE copy.
+(defn put-run [acc :string text :string pp :i64 nm :i64] :string
+  (let [n (i64-shift-right nm 6)
+        m (bit-and nm 7)]
+    (if (= m 1)
+      (string-concat (append-count acc n) (run-line text pp))
+      (if (run-wanted? n m) (string-concat acc (run-line text pp)) acc))))
+
+(defn same-line? [folded :string prev :i64 pos :i64] :bool
+  (= 0 (string-compare-lines folded prev folded pos)))
+
+;; The lines from PP onto ACC. To the OUTPUT operand (mode + 8) the whole
+;; answer is built; to stdout the accumulator is written and released once
+;; a KB of OUTPUT has accumulated AND a run has just ended, so the batch is a
+;; region (arena-scope) whose only state across batches is PP (the cursor
+;; and the new run's first line; its N is 1 by construction). Answers the
+;; PP to continue from, or -1 at the end of the text.
+(defn walk-from [text :string folded :string pp :i64 nm :i64 acc :string] :i64
+  (let [n (string-byte-length text)
+        pos (pp-pos pp)
+        prev (pp-prev pp)
+        to-file? (= 8 (bit-and nm 8))]
+    (if (>= pos n)
+      (do (if to-file? 0 (string-byte-length (emit (put-run acc text pp nm)))) -1)
+      (let [le (line-end text pos)
+            e (i64-shift-right le 1)
+            term? (= 1 (bit-and le 1))]
+        (if (same-line? folded prev pos)
+          (walk-from text folded (pack-pp e prev (pp-term? pp)) (+ nm 64) acc)
+          (let [acc2 (put-run acc text pp nm)
+                next (pack-pp e pos term?)]
+            ;; A batch is bounded by its OUTPUT: handles are spent only on
+            ;; runs that are written (a run's view and its append; a
+            ;; dropped run and every repeated line cost none), so a KB of
+            ;; output bounds the handles under the loader's default 4,096.
+            (if (if to-file? false (>= (string-byte-length acc2) 1024))
+              (do (emit acc2) next)
+              (walk-from text folded next (+ 64 (bit-and nm 63)) acc2))))))))
+
+(defn walk-to-string [text :string folded :string pp :i64 nm :i64 acc :string] :string
+  (let [n (string-byte-length text)
+        pos (pp-pos pp)
+        prev (pp-prev pp)]
+    (if (>= pos n)
+      (put-run acc text pp nm)
+      (let [le (line-end text pos)
+            e (i64-shift-right le 1)
+            term? (= 1 (bit-and le 1))]
+        (if (same-line? folded prev pos)
+          (walk-to-string text folded (pack-pp e prev (pp-term? pp)) (+ nm 64) acc)
+          (walk-to-string text folded (pack-pp e pos term?) (+ 64 (bit-and nm 63))
+                          (put-run acc text pp nm)))))))
+
+(defn walk-batches [text :string folded :string pp :i64 mode :i64] :i64
+  (let [next (arena-scope (walk-from text folded pp (+ 64 mode) ""))]
+    (if (< next 0) 0 (walk-batches text folded next mode))))
 
 (defn spit-file [path :string content :string] :string
   (typed-cap-call :fs/app-data :string :string
@@ -249,18 +286,21 @@ b" 1 2))
         (let [input (arg (decimal-of start))
               to-file? (string=? (decimal-of (+ start 2)) total)]
           (if (readable? input)
-            (let [base (+ (mode-of) (if to-file? 8 0))
+            (let [mode (mode-of)
+                  base (+ mode (if to-file? 8 0))
                   ;; Read AFTER the flag: the text is then the pool's last
                   ;; allocation until the accumulator's first append.
                   text (slurp-file input)
-                  n (string-byte-length text)
-                  first-end (string-index-of text "\n")
-                  out (if (= n 0)
-                        ""
-                        (walk (rest-lines text) (first-line text) 1
-                              (string-substring "x" 0 0)
-                              (+ base (if (< first-end 0) 0 16))))]
-              (if to-file?
-                (do (spit-file (arg (decimal-of (+ start 1))) out) 0)
-                0))
+                  folded (if (= mode 4) (fold text) text)
+                  n (string-byte-length text)]
+              (if (= n 0)
+                (if to-file? (do (spit-file (arg (decimal-of (+ start 1))) "") 0) 0)
+                (let [first-le (line-end text 0)
+                      pp (pack-pp (i64-shift-right first-le 1) 0 (= 1 (bit-and first-le 1)))]
+                  (if to-file?
+                    ;; The whole answer as one value, then one write.
+                    (do (spit-file (arg (decimal-of (+ start 1)))
+                                   (walk-to-string text folded pp (+ 64 base) ""))
+                        0)
+                    (walk-batches text folded pp base)))))
             (complain input)))))))
