@@ -73,10 +73,36 @@ capability call between appends, since every wire answer is interned in the
 pool and moves the tail — and the flags are read once into `mode` for that
 reason.
 
-Measured on a 33 MB file (769,400 lines), CPU seconds, identical output to
-`/usr/bin/uniq`: plain 0.58 s, `-c` 0.75 s, `-d` 0.41, `-u` 0.56, `-i` 0.59;
-`/usr/bin/uniq -c` 0.18 s. The suite's 80,000-line fixture runs every flag
-and the output operand.
+## Lines are offsets, not views (2026-09-16, context ABI v8)
+
+The walk carries two byte offsets into the one text — the cursor and the
+current run's first line — and asks the host whether the two lines are
+the same in place (`string-compare-lines`); the next newline is one host
+search from an offset (`string-index-of-from`). A repeated line therefore
+costs **no handle**; a run boundary costs the run's view and its append.
+`-i` folds the whole text once (`string-fold-ascii`, one byte to one
+byte) and compares in the fold at the same offsets, printing from the
+original. To stdout the accumulator is written and released once a KB of
+output has accumulated and a run has just ended — every batch is a region
+(`arena-scope`) — so the loader's **default 4,096 handles** suffice for
+any input; to the output operand the whole answer is one value and needs
+handles in proportion to the runs written (the suite packages 4 Mi for
+its 80,000-line fixture written to the output operand).
+
+Measured 2026-09-16 on a 33 MB file (769,400 lines, 769,200 runs), CPU
+seconds user, identical output to `/usr/bin/uniq` under 4,096 handles:
+
+| flag | this uniq | this uniq, 2026-09-15 | `/usr/bin/uniq` | uutils `uniq` (Rust) |
+|---|---|---|---|---|
+| (none) | **0.16** | 0.58 | 0.31 | 0.06 |
+| `-c` | 0.25 | 0.75 | 0.38 | 0.07 |
+| `-d` | 0.09 | 0.41 | 0.26 | 0.03 |
+| `-u` | 0.17 | 0.56 | 0.31 | 0.06 |
+| `-i` | 0.18 | 0.59 | 0.40 | 0.06 |
+
+uutils is measured for time only: it terminates an unterminated last line
+and formats `-c` as `%7d`, where `/usr/bin/uniq` (this command's contract,
+measured 2026-09-15) does neither.
 
 ## Capabilities
 
