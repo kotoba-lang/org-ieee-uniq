@@ -94,11 +94,16 @@ seconds user, identical output to `/usr/bin/uniq` under 4,096 handles:
 
 | flag | this uniq | this uniq, 2026-09-15 | `/usr/bin/uniq` | uutils `uniq` (Rust) |
 |---|---|---|---|---|
-| (none) | **0.16** | 0.58 | 0.31 | 0.06 |
+| (none) | **0.10** | 0.58 | 0.31 | 0.06 |
 | `-c` | 0.25 | 0.75 | 0.38 | 0.07 |
 | `-d` | 0.09 | 0.41 | 0.26 | 0.03 |
 | `-u` | 0.17 | 0.56 | 0.31 | 0.06 |
 | `-i` | 0.18 | 0.59 | 0.40 | 0.06 |
+
+On context ABI v10 (2026-09-16) the newline is found as a BYTE
+(`string-find-byte`, no needle handle, no region) and a run's line is
+appended as a RANGE (`string-append-range`, no view): 0.16 → 0.13 (ABI
+v9) → **0.10 s**.
 
 uutils is measured for time only: it terminates an unterminated last line
 and formats `-c` as `%7d`, where `/usr/bin/uniq` (this command's contract,
