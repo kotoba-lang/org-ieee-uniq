@@ -272,14 +272,30 @@ b" 1 2))
 ;;
 ;; A missing INPUT leaves OUTPUT untouched -- it is not created and then
 ;; found empty -- because the input is checked before anything is written.
+(defn stdin [n :string] :string
+  (typed-cap-call :io/read :string :string n))
+
+;; Standard input, to stdout. The flag is read BEFORE the input for the same
+;; reason as below: the text is then the pool's last allocation.
+(defn from-stdin [] :i64
+  (let [mode (mode-of)
+        text (stdin "")
+        folded (if (= mode 4) (fold text) text)
+        n (string-byte-length text)]
+    (if (= n 0)
+      0
+      (let [first-le (line-end text 0)
+            pp (pack-pp (i64-shift-right first-le 1) 0 (= 1 (bit-and first-le 1)))]
+        (walk-batches text folded pp mode)))))
+
 (defn main [] :i64
   (let [total (arg "")
         start (first-operand)]
     (if (string=? (decimal-of start) total)
-      ;; No operand. POSIX reads standard input; there is no stdin
-      ;; capability, so this refuses rather than pretending to have read an
-      ;; empty one.
-      1
+      ;; No operand: standard input, whole (wire 41, 2026-09-16 -- 99% of
+      ;; uniq's invocations in agent tool use are a later pipeline segment,
+      ;; 1,933 of 1,951 measured). Input past the string pool is refused.
+      (from-stdin)
       (if (if (string=? (decimal-of (+ start 1)) total)
             false
             (if (string=? (decimal-of (+ start 2)) total) false true))
